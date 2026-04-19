@@ -71,6 +71,10 @@ vibrate_command = {"vibrate": False, "pattern": "none", "reason": ""}
 imu_lock = threading.Lock()
 vib_lock = threading.Lock()
 alerts   = []   # pre-init so /status works before main loop runs
+live_state      = {"exercise": "none", "rep_count": 0, "alerts": []}
+live_lock       = threading.Lock()
+exercise_change = {"pending": False, "value": 0}
+exercise_lock   = threading.Lock()
 
 # ── Exercise selection screen ─────────────────────────────────────────────────
 _sel = np.zeros((320, 520, 3), dtype=np.uint8)
@@ -106,6 +110,9 @@ rep_count = 0
 rep_state = "up" if exercise == 2 else "down"
 _ema_metric = 0.0   # EMA of angle (curl) or relative elbow-shoulder gap (raise)
 _last_rep_t = 0.0   # cooldown: min 0.5s between reps
+frame_count = 0
+_ax = _gz = _tp = _imu_ay = 0.0   # IMU locals, pre-init before first frame
+_imu_ts = 0
 
 # ── Flask sensor server ───────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -140,27 +147,28 @@ def get_status():
         }
     with vib_lock:
         vib_snap = dict(vibrate_command)
+    with live_lock:
+        state_snap = dict(live_state)
     return jsonify({
         "imu":      imu_snap,
         "vibrate":  vib_snap,
-        "exercise": exercise,
-        "reps":     rep_count,
-        "alerts":   alerts,
+        "exercise": state_snap["exercise"],
+        "reps":     state_snap["rep_count"],
+        "alerts":   state_snap["alerts"],
     })
 
 @app.route('/exercise', methods=['POST'])
 def post_exercise():
-    global exercise, rep_count, rep_state, _ema_metric, _last_rep_t
     data    = request.get_json(silent=True) or {}
     mapping = {"bicep_curl": 1, "squat": 2, "lateral_raise": 3}
     name    = data.get("exercise", "")
     if name in mapping:
-        exercise    = mapping[name]
-        rep_count   = 0
-        rep_state   = "up" if exercise == 2 else "down"
-        _ema_metric = 0.0
-        _last_rep_t = 0.0
-    return jsonify({"status": "ok", "exercise": exercise})
+        with exercise_lock:
+            exercise_change["pending"] = True
+            exercise_change["value"]   = mapping[name]
+    with live_lock:
+        cur = live_state["exercise"]
+    return jsonify({"status": "ok", "exercise": cur})
 
 flask_thread = threading.Thread(
     target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False, debug=False),
@@ -173,6 +181,18 @@ print("[INFO] Sensor server running on port 5000")
 while True:
     ret, frame = cap.read()
     if not ret: continue
+
+    frame_count += 1
+
+    # Apply pending exercise change from /exercise endpoint
+    with exercise_lock:
+        if exercise_change["pending"]:
+            exercise    = exercise_change["value"]
+            rep_count   = 0
+            rep_state   = "up" if exercise == 2 else "down"
+            _ema_metric = 0.0
+            _last_rep_t = 0.0
+            exercise_change["pending"] = False
 
     ti = time.time()
 
@@ -274,24 +294,32 @@ while True:
                 rep_count += 1
                 _last_rep_t = time.time()
 
-    # Vibration command — fire if pose alerts exist
-    if alerts:
-        with vib_lock:
-            vibrate_command["vibrate"] = True
-            vibrate_command["pattern"] = "long" if len(alerts) > 1 else "short"
-            vibrate_command["reason"]  = alerts[0]
-
     # IMU fusion — append sensor-derived alerts
     with imu_lock:
-        _ax = latest_imu["accel"]["x"]
-        _gz = latest_imu["gyro"]["z"]
-        _tp = latest_imu["temp"]
+        _ax     = latest_imu["accel"]["x"]
+        _imu_ay = latest_imu["accel"]["y"]
+        _gz     = latest_imu["gyro"]["z"]
+        _tp     = latest_imu["temp"]
+        _imu_ts = latest_imu["timestamp"]
     if _ax > 0.4:
         alerts.append("Excessive forward lean")
     if abs(_gz) > 150:
         alerts.append("Moving too fast")
     if _tp > 38.5:
         alerts.append("High body temp — rest")
+
+    # Vibration — fires after pose + IMU alerts are both collected
+    if alerts:
+        with vib_lock:
+            vibrate_command["vibrate"] = True
+            vibrate_command["pattern"] = "long" if len(alerts) > 1 else "short"
+            vibrate_command["reason"]  = alerts[0]
+
+    # Publish live state for /status endpoint
+    with live_lock:
+        live_state["exercise"]  = exercise
+        live_state["rep_count"] = rep_count
+        live_state["alerts"]    = alerts
 
     # ── Draw (inline, reuse display buffer) ───────────────────────────────────
     cv2.resize(frame, (DISPLAY_W, DISPLAY_H), dst=display)
@@ -302,33 +330,37 @@ while True:
         cv2.putText(display, NAMES[idx], (x+4, y-4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
 
-    # Top bar: exercise name + rep count
-    cv2.rectangle(display, (0, 0), (DISPLAY_W, 48), (0, 0, 0), -1)
-    cv2.putText(display, f"{EXERCISE_NAMES[exercise]}   Reps: {rep_count}",
-                (10, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    # Top bar (70px): exercise name left, rep count large green right
+    cv2.rectangle(display, (0, 0), (DISPLAY_W, 70), (0, 0, 0), -1)
+    cv2.putText(display, EXERCISE_NAMES[exercise],
+                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+    cv2.putText(display, "REPS",
+                (DISPLAY_W - 85, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 180, 0), 1)
+    cv2.putText(display, str(rep_count),
+                (DISPLAY_W - 80, 62), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 220, 0), 3)
 
-    # FPS / latency line
-    cv2.putText(display, f"FPS:{fps:.1f}  {ms:.1f}ms  DPUCZDX8G-B4096",
-                (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    # Info line: FPS / latency / IMU values + band connection status
+    _band_str = "Band: CONNECTED"     if _imu_ts > 0 else "Band: NOT CONNECTED"
+    _band_col = (0, 220, 0)           if _imu_ts > 0 else (0, 220, 220)
+    cv2.putText(display, f"FPS:{fps:.1f} {ms:.1f}ms  ACC:{_ax:.1f},{_imu_ay:.1f}  GYRO:{_gz:.0f}  T:{_tp:.1f}C",
+                (10, DISPLAY_H - 67), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+    cv2.putText(display, _band_str,
+                (430, DISPLAY_H - 67), cv2.FONT_HERSHEY_SIMPLEX, 0.35, _band_col, 1)
 
-    # IMU status line
-    cv2.putText(display, f"ACC:{latest_imu['accel']['x']:.1f},{latest_imu['accel']['y']:.1f} GYRO:{latest_imu['gyro']['z']:.0f} T:{latest_imu['temp']:.1f}C",
-                (10, DISPLAY_H - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
-
-    # Bottom bar: form status
+    # Bottom bar (60px): green = good form, red = first alert
     if alerts:
-        cv2.rectangle(display, (0, DISPLAY_H - 52), (DISPLAY_W, DISPLAY_H), (0, 0, 180), -1)
+        cv2.rectangle(display, (0, DISPLAY_H - 60), (DISPLAY_W, DISPLAY_H), (0, 0, 180), -1)
         cv2.putText(display, alerts[0],
-                    (10, DISPLAY_H - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+                    (10, DISPLAY_H - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     else:
-        cv2.rectangle(display, (0, DISPLAY_H - 52), (DISPLAY_W, DISPLAY_H), (0, 140, 0), -1)
+        cv2.rectangle(display, (0, DISPLAY_H - 60), (DISPLAY_W, DISPLAY_H), (0, 140, 0), -1)
         cv2.putText(display, "GOOD FORM",
-                    (10, DISPLAY_H - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+                    (10, DISPLAY_H - 18), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
     cv2.imshow("KV260 DPU Pose", display)
 
-    if fc % 30 == 1:
-        print(f"[PERF] {ms:.1f}ms | FPS:{fps:.1f} | reps:{rep_count} | alerts:{alerts}")
+    if frame_count % 100 == 0:
+        print(f"[SUMMARY] Exercise:{EXERCISE_NAMES[exercise]} Reps:{rep_count} Alerts:{alerts} Band:{'connected' if _imu_ts > 0 else 'disconnected'} Latency:{ms:.1f}ms FPS:{fps:.1f}")
 
     _key = cv2.waitKey(1) & 0xFF
     if _key == ord('q'):
