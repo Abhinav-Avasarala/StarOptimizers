@@ -14,6 +14,16 @@ import time
 from flask import Flask, request, jsonify, Response
 import threading
 import socket
+import sys
+
+# ── Exercise selection (CLI argument) ─────────────────────────────────────────
+_valid = ["bicep_curl", "squat", "lateral_raise"]
+if len(sys.argv) < 2 or sys.argv[1] not in _valid:
+    print("Usage: python3 dpu_pose.py [bicep_curl|squat|lateral_raise]")
+    sys.exit(1)
+exercise = sys.argv[1]
+print(f"[INFO] Exercise selected: {exercise}")
+exercise = {"bicep_curl": 1, "squat": 2, "lateral_raise": 3}[exercise]
 
 # ── Config ────────────────────────────────────────────────────────────────────
 XMODEL_PATH = "/home/ubuntu/sp_net/sp_net.xmodel"
@@ -78,24 +88,6 @@ live_state      = {"exercise": "none", "rep_count": 0, "alerts": []}
 live_lock       = threading.Lock()
 exercise_change = {"pending": False, "value": 0}
 exercise_lock   = threading.Lock()
-
-# ── Exercise selection screen ─────────────────────────────────────────────────
-_sel = np.zeros((320, 520, 3), dtype=np.uint8)
-_sel[:] = (30, 30, 30)
-cv2.putText(_sel, "Select Exercise",      ( 75,  60), cv2.FONT_HERSHEY_SIMPLEX, 1.1,  (0, 255, 255), 2)
-cv2.putText(_sel, "1  -  Bicep Curl",    (100, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9,  (255, 255, 255), 2)
-cv2.putText(_sel, "2  -  Squat",         (100, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.9,  (255, 255, 255), 2)
-cv2.putText(_sel, "3  -  Lateral Raise", (100, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.9,  (255, 255, 255), 2)
-cv2.putText(_sel, "Press key to begin",  ( 90, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 100),  2)
-cv2.imshow("Select Exercise", _sel)
-
-exercise = 0
-while exercise == 0:
-    _k = cv2.waitKey(100) & 0xFF
-    if   _k == ord('1'): exercise = 1
-    elif _k == ord('2'): exercise = 2
-    elif _k == ord('3'): exercise = 3
-cv2.destroyWindow("Select Exercise")
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(CAMERA_INDEX)
