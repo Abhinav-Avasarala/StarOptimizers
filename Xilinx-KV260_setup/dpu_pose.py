@@ -89,6 +89,8 @@ t_fps = time.time()
 # Rep counter state (pre-allocated outside loop)
 rep_count = 0
 rep_state = "up" if exercise == 2 else "down"
+_ema_metric = 0.0   # EMA of angle (curl) or relative elbow-shoulder gap (raise)
+_last_rep_t = 0.0   # cooldown: min 0.5s between reps
 
 # ── Main loop (everything inline) ─────────────────────────────────────────────
 while True:
@@ -143,13 +145,14 @@ while True:
                 alerts.append("Keep elbow pinned to side")
             if _ang > 150:
                 alerts.append("Full range of motion")
-            # Rep: wrist y < 200 = top, > 280 = bottom
-            _wy = kps[2][1]
-            if rep_state == "down" and _wy < 200:
+            # Rep: angle-based with EMA smoothing + cooldown (position-independent)
+            _ema_metric = 0.35 * _ang + 0.65 * _ema_metric
+            if rep_state == "down" and _ema_metric < 70:
                 rep_state = "up"
-            elif rep_state == "up" and _wy > 280:
+            elif rep_state == "up" and _ema_metric > 140 and (time.time() - _last_rep_t) > 0.5:
                 rep_state = "down"
                 rep_count += 1
+                _last_rep_t = time.time()
 
         elif exercise == 2:  # Squat ──────────────────────────────────────────
             _ba = np.array(kps[6]) - np.array(kps[7])
@@ -183,13 +186,15 @@ while True:
                 alerts.append("Don't raise above shoulder")
             if _ang > 170:
                 alerts.append("Keep slight bend in elbow")
-            # Rep: elbow y < 200 = raised, > 280 = lowered
-            _ey = kps[1][1]
-            if rep_state == "down" and _ey < 200:
+            # Rep: elbow-shoulder y gap, EMA smoothed + cooldown (position-independent)
+            # positive = elbow below shoulder, ~0 or negative = elbow at/above shoulder
+            _ema_metric = 0.35 * (kps[1][1] - kps[0][1]) + 0.65 * _ema_metric
+            if rep_state == "down" and _ema_metric < 15:
                 rep_state = "up"
-            elif rep_state == "up" and _ey > 280:
+            elif rep_state == "up" and _ema_metric > 55 and (time.time() - _last_rep_t) > 0.5:
                 rep_state = "down"
                 rep_count += 1
+                _last_rep_t = time.time()
 
     # ── Draw (inline, reuse display buffer) ───────────────────────────────────
     cv2.resize(frame, (DISPLAY_W, DISPLAY_H), dst=display)
@@ -230,6 +235,8 @@ while True:
     elif _key == ord('r'):
         rep_count = 0
         rep_state = "up" if exercise == 2 else "down"
+        _ema_metric = 0.0
+        _last_rep_t = 0.0
 
 cap.release()
 cv2.destroyAllWindows()
