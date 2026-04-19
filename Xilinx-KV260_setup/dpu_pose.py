@@ -85,7 +85,8 @@ alerts       = []   # pre-init so /status works before main loop runs
 output_frame = None
 frame_lock   = threading.Lock()
 live_state      = {"exercise": "none", "rep_count": 0, "alerts": [], "instructions": [], "phase": "idle", "velocity": 0.0,
-                   "last_rep_feedback": "", "last_rep_quality": "none", "last_rep_severity": "none", "rep_buffer_count": 0}
+                   "last_rep_feedback": "", "last_rep_quality": "none", "last_rep_severity": "none", "rep_buffer_count": 0,
+                   "total_reps": 0, "good_reps": 0, "feedback_age": 9999.0}
 live_lock       = threading.Lock()
 exercise_change = {"pending": False, "value": 0}
 exercise_lock   = threading.Lock()
@@ -116,22 +117,22 @@ SLOW_THRESHOLD   = 3.0   # px/frame — slow controlled movement still gets chec
 ALERT_COOLDOWN   = 3.0
 
 ALERT_SEVERITY = {
-    # Critical — long vibration (joint safety risk)
-    "Push right knee outward":      "critical",
-    "Push left knee outward":       "critical",
-    "Keep chest up — back rounding":"critical",
-    "Pin your elbow to your body":  "critical",
-    # Moderate — short vibration (form degradation)
-    "Raise higher — not at shoulder level yet": "moderate",
-    "Too high — stop at shoulder level":        "moderate",
+    # Critical
+    "Push right knee outward":         "critical",
+    "Push left knee outward":          "critical",
+    "Keep chest up - back rounding":   "critical",
+    "Pin your elbow to your body":     "critical",
+    # Moderate
+    "Raise higher - not at shoulder level yet": "moderate",
+    "Too high - stop at shoulder level":        "moderate",
     "Raise both arms evenly":                   "moderate",
-    "Curl more — squeeze the bicep":            "moderate",
-    "Go deeper — break parallel":               "moderate",
-    "High body temp — rest":                    "moderate",
-    # Minor — show on screen, no vibration
-    "Slow down — control the movement": "minor",
-    "Slow down — control the squat":    "minor",
-    "Slow down — control the curl":     "minor",
+    "Curl more - squeeze the bicep":            "moderate",
+    "Go deeper - break parallel":               "moderate",
+    "High body temp - rest":                    "moderate",
+    # Minor
+    "Slow down - control the movement": "minor",
+    "Slow down - control the squat":    "minor",
+    "Slow down - control the curl":     "minor",
     "Excessive forward lean":           "minor",
     "Moving too fast":                  "minor",
 }
@@ -156,6 +157,10 @@ rep_start_time         = 0.0
 squat_angles_this_rep  = []
 curl_angles_this_rep   = []
 raise_heights_this_rep = []
+total_reps             = 0
+good_reps              = 0
+feedback_display_timer = 0.0
+FEEDBACK_DISPLAY_DURATION = 4.0
 
 # ── Flask sensor server ───────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -205,6 +210,9 @@ def get_status():
         "last_rep_quality": state_snap.get("last_rep_quality", "none"),
         "last_rep_severity":state_snap.get("last_rep_severity", "none"),
         "rep_buffer_count": state_snap.get("rep_buffer_count", 0),
+        "total_reps":       state_snap.get("total_reps", 0),
+        "good_reps":        state_snap.get("good_reps", 0),
+        "feedback_age":     state_snap.get("feedback_age", 9999.0),
     })
 
 def generate_frames():
@@ -439,7 +447,8 @@ def index():
 
       <div class="card">
         <div class="card-label">Reps</div>
-        <div id="rep-count">0</div>
+        <div id="rep-count" style="font-size:72px;font-weight:800;color:#00ff00;line-height:1;text-align:center">0</div>
+        <div id="good-reps" style="font-size:14px;color:#88ff88;text-align:center;margin-top:2px">0 good reps</div>
       </div>
 
       <div class="card">
@@ -542,8 +551,9 @@ def index():
         nameEl.textContent = EXERCISE_LABELS[exKey] || exKey;
         nameEl.className = EX_CLASS[exKey] || "ex-none";
 
-        // Rep count
-        document.getElementById("rep-count").textContent = d.reps ?? 0;
+        // Rep counts
+        document.getElementById("rep-count").textContent = d.total_reps ?? d.reps ?? 0;
+        document.getElementById("good-reps").textContent = (d.good_reps ?? 0) + " good reps";
 
         // Phase indicator
         const phase = d.phase || "idle";
@@ -564,15 +574,18 @@ def index():
           instrEl.innerHTML = '<span class="instruction-card">—</span>';
         }
 
-        // Last rep feedback card
-        const quality = d.last_rep_quality || "none";
-        const feedback = d.last_rep_feedback || "";
-        const repSev = d.last_rep_severity || "none";
+        // Last rep feedback card — respect 4s display timer
+        const feedbackAge = d.feedback_age ?? 9999;
+        const feedbackActive = feedbackAge < 4.0;
+        const quality = feedbackActive ? (d.last_rep_quality || "none") : "none";
+        const feedback = feedbackActive ? (d.last_rep_feedback || "") : "";
+        const repSev = feedbackActive ? (d.last_rep_severity || "none") : "none";
         const cardBg = {perfect:"#0d1f0d", good:"#0d1525", needs_work:"#1f1200", poor:"#1f0000", none:"#181818"}[quality] || "#181818";
         const cardBorder = {perfect:"#1a4a1a", good:"#1a3a5a", needs_work:"#4a2800", poor:"#4a0000", none:"#222"}[quality] || "#222";
         const lrCard = document.getElementById("last-rep-card");
         lrCard.style.background = cardBg; lrCard.style.borderColor = cardBorder;
         document.getElementById("last-rep-feedback").textContent = feedback || "Complete a rep for feedback";
+        document.getElementById("last-rep-feedback").style.color = feedback ? "#aaa" : "#444";
         const badge = document.getElementById("last-rep-badge");
         const sevEl = document.getElementById("last-rep-sev");
         if (repSev !== "none" && feedback) {
@@ -690,6 +703,10 @@ while True:
             squat_angles_this_rep  = []
             curl_angles_this_rep   = []
             raise_heights_this_rep = []
+            total_reps             = 0
+            good_reps              = 0
+            rep_count              = 0
+            feedback_display_timer = 0.0
             exercise_change["pending"] = False
 
     ti = time.time()
@@ -786,30 +803,33 @@ while True:
                 curl_angles_this_rep.append(_ang)
                 if kps[1][0] > kps[0][0] + 40 and "Pin your elbow to your body" not in rep_alerts_buffer:
                     rep_alerts_buffer.append("Pin your elbow to your body")
-                if curl_started and _ang > 150 and "Curl more \u2014 squeeze the bicep" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Curl more \u2014 squeeze the bicep")
-                if rep_phase == "active" and max_velocity > 30 and "Slow down \u2014 control the curl" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Slow down \u2014 control the curl")
+                if curl_started and _ang > 150 and "Curl more - squeeze the bicep" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Curl more - squeeze the bicep")
+                if rep_phase == "active" and max_velocity > 30 and "Slow down - control the curl" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Slow down - control the curl")
             _ema_metric = 0.35 * _ang + 0.65 * _ema_metric
-            if rep_state == "down" and _ema_metric < 70:
+            if rep_state == "down" and _ema_metric < 100:
                 rep_state = "up"
-            elif rep_state == "up" and _ema_metric > 140 and (time.time() - _last_rep_t) > 0.5:
-                rep_state = "down"; rep_count += 1; _last_rep_t = time.time()
+            elif rep_state == "up" and _ema_metric > 130 and (time.time() - _last_rep_t) > 0.5:
+                rep_state = "down"; total_reps += 1; rep_count = total_reps; _last_rep_t = time.time()
                 curl_started = False
                 _rep_issues = len(rep_alerts_buffer)
                 if _rep_issues == 0:
-                    last_rep_quality = "perfect"; last_rep_feedback = f"Rep {rep_count} \u2014 perfect form!"; last_rep_severity = "none"
+                    last_rep_quality = "perfect"; last_rep_feedback = f"Rep {rep_count} - perfect form!"; last_rep_severity = "none"
                 elif _rep_issues == 1:
-                    last_rep_quality = "good"; last_rep_feedback = f"Rep {rep_count} \u2014 {rep_alerts_buffer[0]}"
+                    last_rep_quality = "good"; last_rep_feedback = f"Rep {rep_count} - {rep_alerts_buffer[0]}"
                     last_rep_severity = ALERT_SEVERITY.get(rep_alerts_buffer[0], "minor")
                 else:
                     _srank = {"critical": 3, "moderate": 2, "minor": 1}
                     _worst = max(rep_alerts_buffer, key=lambda a: _srank.get(ALERT_SEVERITY.get(a, "minor"), 1))
                     _wsev = ALERT_SEVERITY.get(_worst, "minor")
                     last_rep_quality = "poor" if _wsev == "critical" else "needs_work"
-                    last_rep_feedback = f"Rep {rep_count} \u2014 {_worst}"; last_rep_severity = _wsev
+                    last_rep_feedback = f"Rep {rep_count} - {_worst}"; last_rep_severity = _wsev
+                if last_rep_severity in ("none", "minor"):
+                    good_reps += 1
                 if curl_angles_this_rep:
-                    last_rep_feedback += f" (peak: {min(curl_angles_this_rep):.0f}\u00b0)"
+                    last_rep_feedback += f" (peak: {min(curl_angles_this_rep):.0f}deg)"
+                feedback_display_timer = time.time()
                 with vib_lock:
                     if last_rep_severity == "critical":
                         vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "long"
@@ -835,31 +855,34 @@ while True:
                     rep_alerts_buffer.append("Push right knee outward")
                 if kps[10][0] > kps[9][0] + 25 and "Push left knee outward" not in rep_alerts_buffer:
                     rep_alerts_buffer.append("Push left knee outward")
-                if kps[13][1] > kps[6][1] + 20 and "Keep chest up \u2014 back rounding" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Keep chest up \u2014 back rounding")
-                if rep_phase == "active" and max_velocity > 30 and "Slow down \u2014 control the squat" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Slow down \u2014 control the squat")
+                if kps[13][1] > kps[6][1] + 20 and "Keep chest up - back rounding" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Keep chest up - back rounding")
+                if rep_phase == "active" and max_velocity > 30 and "Slow down - control the squat" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Slow down - control the squat")
             _ema_metric = 0.35 * _ang + 0.65 * _ema_metric
-            if rep_state == "up" and _ema_metric < 110:
+            if rep_state == "up" and _ema_metric < 130:
                 rep_state = "down"
-            elif rep_state == "down" and _ema_metric > 155 and (time.time() - _last_rep_t) > 0.5:
-                if squat_angles_this_rep and min(squat_angles_this_rep) > 120 and "Go deeper \u2014 break parallel" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Go deeper \u2014 break parallel")
-                rep_state = "up"; rep_count += 1; _last_rep_t = time.time()
+            elif rep_state == "down" and _ema_metric > 150 and (time.time() - _last_rep_t) > 0.5:
+                if squat_angles_this_rep and min(squat_angles_this_rep) > 120 and "Go deeper - break parallel" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Go deeper - break parallel")
+                rep_state = "up"; total_reps += 1; rep_count = total_reps; _last_rep_t = time.time()
                 _rep_issues = len(rep_alerts_buffer)
                 if _rep_issues == 0:
-                    last_rep_quality = "perfect"; last_rep_feedback = f"Rep {rep_count} \u2014 perfect form!"; last_rep_severity = "none"
+                    last_rep_quality = "perfect"; last_rep_feedback = f"Rep {rep_count} - perfect form!"; last_rep_severity = "none"
                 elif _rep_issues == 1:
-                    last_rep_quality = "good"; last_rep_feedback = f"Rep {rep_count} \u2014 {rep_alerts_buffer[0]}"
+                    last_rep_quality = "good"; last_rep_feedback = f"Rep {rep_count} - {rep_alerts_buffer[0]}"
                     last_rep_severity = ALERT_SEVERITY.get(rep_alerts_buffer[0], "minor")
                 else:
                     _srank = {"critical": 3, "moderate": 2, "minor": 1}
                     _worst = max(rep_alerts_buffer, key=lambda a: _srank.get(ALERT_SEVERITY.get(a, "minor"), 1))
                     _wsev = ALERT_SEVERITY.get(_worst, "minor")
                     last_rep_quality = "poor" if _wsev == "critical" else "needs_work"
-                    last_rep_feedback = f"Rep {rep_count} \u2014 {_worst}"; last_rep_severity = _wsev
+                    last_rep_feedback = f"Rep {rep_count} - {_worst}"; last_rep_severity = _wsev
+                if last_rep_severity in ("none", "minor"):
+                    good_reps += 1
                 if squat_angles_this_rep:
-                    last_rep_feedback += f" (depth: {min(squat_angles_this_rep):.0f}\u00b0)"
+                    last_rep_feedback += f" (depth: {min(squat_angles_this_rep):.0f}deg)"
+                feedback_display_timer = time.time()
                 with vib_lock:
                     if last_rep_severity == "critical":
                         vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "long"
@@ -876,35 +899,38 @@ while True:
             instructions = ["Raise arms to shoulder height", "Slight bend in elbow"]
             if rep_phase in ("active", "slow_active"):
                 raise_heights_this_rep.append(kps[1][1] - kps[0][1])
-                if kps[1][1] > kps[0][1] + 40 and "Raise higher \u2014 not at shoulder level yet" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Raise higher \u2014 not at shoulder level yet")
-                if kps[1][1] < kps[0][1] - 50 and "Too high \u2014 stop at shoulder level" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Too high \u2014 stop at shoulder level")
+                if kps[1][1] > kps[0][1] + 40 and "Raise higher - not at shoulder level yet" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Raise higher - not at shoulder level yet")
+                if kps[1][1] < kps[0][1] - 50 and "Too high - stop at shoulder level" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Too high - stop at shoulder level")
                 _left_raise  = kps[0][1] - kps[4][1]
                 _right_raise = kps[0][1] - kps[1][1]
                 if abs(_left_raise - _right_raise) > 40 and "Raise both arms evenly" not in rep_alerts_buffer:
                     rep_alerts_buffer.append("Raise both arms evenly")
-                if rep_phase == "active" and max_velocity > 35 and "Slow down \u2014 control the movement" not in rep_alerts_buffer:
-                    rep_alerts_buffer.append("Slow down \u2014 control the movement")
+                if rep_phase == "active" and max_velocity > 35 and "Slow down - control the movement" not in rep_alerts_buffer:
+                    rep_alerts_buffer.append("Slow down - control the movement")
             _ema_metric = 0.35 * (kps[1][1] - kps[0][1]) + 0.65 * _ema_metric
-            if rep_state == "down" and _ema_metric < 15:
+            if rep_state == "down" and _ema_metric < 30:
                 rep_state = "up"
-            elif rep_state == "up" and _ema_metric > 55 and (time.time() - _last_rep_t) > 0.5:
-                rep_state = "down"; rep_count += 1; _last_rep_t = time.time()
+            elif rep_state == "up" and _ema_metric > 50 and (time.time() - _last_rep_t) > 0.5:
+                rep_state = "down"; total_reps += 1; rep_count = total_reps; _last_rep_t = time.time()
                 _rep_issues = len(rep_alerts_buffer)
                 if _rep_issues == 0:
-                    last_rep_quality = "perfect"; last_rep_feedback = f"Rep {rep_count} \u2014 perfect form!"; last_rep_severity = "none"
+                    last_rep_quality = "perfect"; last_rep_feedback = f"Rep {rep_count} - perfect form!"; last_rep_severity = "none"
                 elif _rep_issues == 1:
-                    last_rep_quality = "good"; last_rep_feedback = f"Rep {rep_count} \u2014 {rep_alerts_buffer[0]}"
+                    last_rep_quality = "good"; last_rep_feedback = f"Rep {rep_count} - {rep_alerts_buffer[0]}"
                     last_rep_severity = ALERT_SEVERITY.get(rep_alerts_buffer[0], "minor")
                 else:
                     _srank = {"critical": 3, "moderate": 2, "minor": 1}
                     _worst = max(rep_alerts_buffer, key=lambda a: _srank.get(ALERT_SEVERITY.get(a, "minor"), 1))
                     _wsev = ALERT_SEVERITY.get(_worst, "minor")
                     last_rep_quality = "poor" if _wsev == "critical" else "needs_work"
-                    last_rep_feedback = f"Rep {rep_count} \u2014 {_worst}"; last_rep_severity = _wsev
+                    last_rep_feedback = f"Rep {rep_count} - {_worst}"; last_rep_severity = _wsev
+                if last_rep_severity in ("none", "minor"):
+                    good_reps += 1
                 if raise_heights_this_rep:
                     last_rep_feedback += f" (height: {'good' if min(raise_heights_this_rep) < 20 else 'low'})"
+                feedback_display_timer = time.time()
                 with vib_lock:
                     if last_rep_severity == "critical":
                         vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "long"
@@ -926,7 +952,7 @@ while True:
         _imu_ts = latest_imu["timestamp"]
     if _imu_ts > 0:
         if _tp > 38.5:
-            _at = "High body temp — rest"
+            _at = "High body temp - rest"
             if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
                 alerts.append(_at); last_alert_time[_at] = now
         if abs(_gz) > 200:
@@ -946,6 +972,9 @@ while True:
         live_state["last_rep_quality"]  = last_rep_quality
         live_state["last_rep_severity"] = last_rep_severity
         live_state["rep_buffer_count"]  = len(rep_alerts_buffer)
+        live_state["total_reps"]        = total_reps
+        live_state["good_reps"]         = good_reps
+        live_state["feedback_age"]      = round(time.time() - feedback_display_timer, 1)
 
     # ── Draw (inline, reuse display buffer) ───────────────────────────────────
     cv2.resize(frame, (DISPLAY_W, DISPLAY_H), dst=display)
@@ -956,14 +985,14 @@ while True:
         cv2.putText(display, NAMES[idx], (x+4, y-4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
 
-    # Top bar (70px): exercise name left, rep count large green right
-    cv2.rectangle(display, (0, 0), (DISPLAY_W, 70), (0, 0, 0), -1)
+    # Top bar (90px): exercise name left, rep counts right
+    cv2.rectangle(display, (0, 0), (DISPLAY_W, 90), (0, 0, 0), -1)
     cv2.putText(display, EXERCISE_NAMES[exercise],
-                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
-    cv2.putText(display, "REPS",
-                (DISPLAY_W - 85, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 180, 0), 1)
-    cv2.putText(display, str(rep_count),
-                (DISPLAY_W - 80, 62), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 220, 0), 3)
+                (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+    cv2.putText(display, str(total_reps),
+                (DISPLAY_W - 120, 68), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 0), 4)
+    cv2.putText(display, f"{good_reps} good",
+                (DISPLAY_W - 120, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
 
     # Info line (just below top bar)
     _band_str = "Band: CONNECTED"     if _imu_ts > 0 else "Band: NOT CONNECTED"
@@ -983,20 +1012,21 @@ while True:
         cv2.putText(display, " | ".join(instructions), (10, DISPLAY_H - 63),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1)
 
-    # Feedback bar — shows result of last completed rep (urgent IMU overrides)
-    _fb_colors = {"perfect": (0, 140, 0), "good": (0, 100, 180), "needs_work": (0, 100, 200), "poor": (0, 0, 180), "none": (40, 40, 40)}
+    # Feedback bar — timed, resets after FEEDBACK_DISPLAY_DURATION seconds
+    _fb_colors = {"perfect": (0, 140, 0), "good": (0, 100, 180), "needs_work": (0, 100, 200), "poor": (0, 0, 180), "none": (30, 30, 30)}
+    _feedback_active = (time.time() - feedback_display_timer) < FEEDBACK_DISPLAY_DURATION
     if alerts:
         cv2.rectangle(display, (0, DISPLAY_H - 55), (DISPLAY_W, DISPLAY_H), (0, 0, 200), -1)
         cv2.putText(display, f"! {alerts[0]}", (10, DISPLAY_H - 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    elif _feedback_active and last_rep_feedback:
+        cv2.rectangle(display, (0, DISPLAY_H - 55), (DISPLAY_W, DISPLAY_H), _fb_colors.get(last_rep_quality, (30, 30, 30)), -1)
+        cv2.putText(display, last_rep_feedback, (10, DISPLAY_H - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     else:
-        cv2.rectangle(display, (0, DISPLAY_H - 55), (DISPLAY_W, DISPLAY_H), _fb_colors.get(last_rep_quality, (40, 40, 40)), -1)
-        if last_rep_feedback:
-            cv2.putText(display, last_rep_feedback, (10, DISPLAY_H - 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        else:
-            cv2.putText(display, "Complete a rep for feedback", (10, DISPLAY_H - 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
+        cv2.rectangle(display, (0, DISPLAY_H - 55), (DISPLAY_W, DISPLAY_H), (30, 30, 30), -1)
+        cv2.putText(display, "Complete a rep for feedback", (10, DISPLAY_H - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 2)
     # Recording dot — active phase indicator
     if rep_phase in ("active", "slow_active"):
         cv2.circle(display, (DISPLAY_W - 20, DISPLAY_H - 70), 8, (0, 0, 255), -1)
@@ -1008,17 +1038,19 @@ while True:
         output_frame = display.copy()
 
     if frame_count % 100 == 0:
-        print(f"[SUMMARY] Exercise:{EXERCISE_NAMES[exercise]} Reps:{rep_count} LastRep:{last_rep_quality}|{last_rep_feedback[:40]} UrgentAlerts:{alerts} Band:{'connected' if _imu_ts > 0 else 'disconnected'} Latency:{ms:.1f}ms FPS:{fps:.1f}")
+        print(f"[SUMMARY] Exercise:{EXERCISE_NAMES[exercise]} Total:{total_reps} Good:{good_reps} LastRep:{last_rep_quality}|{last_rep_feedback[:40]} Band:{'connected' if _imu_ts > 0 else 'disconnected'} Latency:{ms:.1f}ms FPS:{fps:.1f}")
 
     _key = cv2.waitKey(1) & 0xFF
     if _key == ord('q'):
         break
     elif _key == ord('r'):
-        rep_count = 0; rep_state = "up" if exercise == 2 else "down"
+        rep_count = 0; total_reps = 0; good_reps = 0
+        rep_state = "up" if exercise == 2 else "down"
         _ema_metric = 0.0; _last_rep_t = 0.0
         rep_alerts_buffer = []; curl_angles_this_rep = []
         squat_angles_this_rep = []; raise_heights_this_rep = []
         last_rep_feedback = ""; last_rep_quality = "none"; last_rep_severity = "none"
+        feedback_display_timer = 0.0
 
 cap.release()
 print(f"[INFO] Done. Final reps: {rep_count}")
