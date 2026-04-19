@@ -11,8 +11,9 @@ import numpy as np
 import xir
 import vart
 import time
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import threading
+import socket
 
 # ── Config ────────────────────────────────────────────────────────────────────
 XMODEL_PATH = "/home/ubuntu/sp_net/sp_net.xmodel"
@@ -70,7 +71,9 @@ latest_imu = {
 vibrate_command = {"vibrate": False, "pattern": "none", "reason": ""}
 imu_lock = threading.Lock()
 vib_lock = threading.Lock()
-alerts   = []   # pre-init so /status works before main loop runs
+alerts       = []   # pre-init so /status works before main loop runs
+output_frame = None
+frame_lock   = threading.Lock()
 live_state      = {"exercise": "none", "rep_count": 0, "alerts": []}
 live_lock       = threading.Lock()
 exercise_change = {"pending": False, "value": 0}
@@ -157,6 +160,41 @@ def get_status():
         "alerts":   state_snap["alerts"],
     })
 
+def generate_frames():
+    global output_frame
+    while True:
+        with frame_lock:
+            if output_frame is None:
+                continue
+            ret, buffer = cv2.imencode('.jpg', output_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if not ret:
+                continue
+            frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+@app.route('/video')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/')
+def index():
+    return '''<html>
+<head>
+  <title>KV260 Pose Monitor</title>
+  <style>
+    body { background: #111; color: white; font-family: Arial; text-align: center; margin: 0; padding: 20px; }
+    img  { width: 100%; max-width: 800px; border: 2px solid #333; }
+    h2   { color: #0f0; }
+  </style>
+</head>
+<body>
+  <h2>KV260 DPU Pose Estimation</h2>
+  <img src="/video" /><br><br>
+  <a href="/status" style="color:#0af">System Status</a>
+</body>
+</html>'''
+
 @app.route('/exercise', methods=['POST'])
 def post_exercise():
     data    = request.get_json(silent=True) or {}
@@ -175,7 +213,10 @@ flask_thread = threading.Thread(
     daemon=True
 )
 flask_thread.start()
-print("[INFO] Sensor server running on port 5000")
+_hostname = socket.gethostname()
+_local_ip = socket.gethostbyname(_hostname)
+print(f"[INFO] Video stream: http://{_local_ip}:5000/")
+print(f"[INFO] Or try:       http://kria.local:5000/")
 
 # ── Main loop (everything inline) ─────────────────────────────────────────────
 while True:
@@ -357,7 +398,9 @@ while True:
         cv2.putText(display, "GOOD FORM",
                     (10, DISPLAY_H - 18), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
-    cv2.imshow("KV260 DPU Pose", display)
+    # Push annotated frame to MJPEG stream
+    with frame_lock:
+        output_frame = display.copy()
 
     if frame_count % 100 == 0:
         print(f"[SUMMARY] Exercise:{EXERCISE_NAMES[exercise]} Reps:{rep_count} Alerts:{alerts} Band:{'connected' if _imu_ts > 0 else 'disconnected'} Latency:{ms:.1f}ms FPS:{fps:.1f}")
@@ -372,5 +415,4 @@ while True:
         _last_rep_t = 0.0
 
 cap.release()
-cv2.destroyAllWindows()
 print(f"[INFO] Done. Final reps: {rep_count}")
