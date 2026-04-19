@@ -84,7 +84,7 @@ vib_lock = threading.Lock()
 alerts       = []   # pre-init so /status works before main loop runs
 output_frame = None
 frame_lock   = threading.Lock()
-live_state      = {"exercise": "none", "rep_count": 0, "alerts": []}
+live_state      = {"exercise": "none", "rep_count": 0, "alerts": [], "instructions": [], "phase": "idle", "velocity": 0.0}
 live_lock       = threading.Lock()
 exercise_change = {"pending": False, "value": 0}
 exercise_lock   = threading.Lock()
@@ -108,6 +108,20 @@ _last_rep_t = 0.0   # cooldown: min 0.5s between reps
 frame_count = 0
 _ax = _gz = _tp = _imu_ay = 0.0   # IMU locals, pre-init before first frame
 _imu_ts = 0
+
+# Phase tracking (pre-allocated outside loop)
+MOVEMENT_THRESHOLD = 8.0
+ALERT_COOLDOWN     = 3.0
+rep_phase          = "idle"
+phase_frame_count  = 0
+last_alert_time    = {}
+smoothed_kps       = [(0, 0)] * 14
+kps_history        = [[(0, 0)] * 14 for _ in range(5)]
+history_idx        = 0
+prev_kps           = [(0, 0)] * 14
+joint_velocities   = [0.0] * 14
+max_velocity       = 0.0
+instructions       = []
 
 # ── Flask sensor server ───────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -145,11 +159,14 @@ def get_status():
     with live_lock:
         state_snap = dict(live_state)
     return jsonify({
-        "imu":      imu_snap,
-        "vibrate":  vib_snap,
-        "exercise": state_snap["exercise"],
-        "reps":     state_snap["rep_count"],
-        "alerts":   state_snap["alerts"],
+        "imu":          imu_snap,
+        "vibrate":      vib_snap,
+        "exercise":     state_snap["exercise"],
+        "reps":         state_snap["rep_count"],
+        "alerts":       state_snap["alerts"],
+        "instructions": state_snap.get("instructions", []),
+        "phase":        state_snap.get("phase", "idle"),
+        "velocity":     state_snap.get("velocity", 0.0),
     })
 
 def generate_frames():
@@ -277,10 +294,25 @@ def index():
       font-size: 12px;
       color: #ff8a80;
     }
-    .no-alert {
+    .no-alert { font-size: 12px; color: #2e7d32; }
+
+    #instructions-list { display: flex; flex-direction: column; gap: 5px; }
+    .instruction-card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      padding: 7px 10px;
       font-size: 12px;
-      color: #2e7d32;
+      color: #888;
     }
+
+    .phase-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .phase-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .phase-active   { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+    .phase-returning{ background: #ffb300; box-shadow: 0 0 6px #ffb300; }
+    .phase-idle     { background: #444; }
+    #phase-label    { font-weight: 600; }
+    #velocity-label { font-size: 11px; color: #555; margin-left: auto; }
 
     .band-row {
       display: flex;
@@ -372,6 +404,20 @@ def index():
       </div>
 
       <div class="card">
+        <div class="card-label">Phase</div>
+        <div class="phase-row">
+          <div class="phase-dot phase-idle" id="phase-dot"></div>
+          <span id="phase-label">Idle</span>
+          <span id="velocity-label">0 px/f</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Instructions</div>
+        <div id="instructions-list"><span class="instruction-card">—</span></div>
+      </div>
+
+      <div class="card">
         <div class="card-label">Form Alerts</div>
         <div id="alerts-list"><span class="no-alert">&#10003; Good form</span></div>
       </div>
@@ -444,6 +490,25 @@ def index():
 
         // Rep count
         document.getElementById("rep-count").textContent = d.reps ?? 0;
+
+        // Phase indicator
+        const phase = d.phase || "idle";
+        const dotEl = document.getElementById("phase-dot");
+        dotEl.className = "phase-dot phase-" + phase;
+        document.getElementById("phase-label").textContent =
+          phase.charAt(0).toUpperCase() + phase.slice(1);
+        document.getElementById("velocity-label").textContent =
+          (d.velocity ?? 0).toFixed(1) + " px/f";
+
+        // Instructions
+        const instrEl = document.getElementById("instructions-list");
+        if (d.instructions && d.instructions.length) {
+          instrEl.innerHTML = d.instructions
+            .map(t => `<div class="instruction-card">&#8227; ${t}</div>`)
+            .join("");
+        } else {
+          instrEl.innerHTML = '<span class="instruction-card">—</span>';
+        }
 
         // Alerts
         const alertsEl = document.getElementById("alerts-list");
@@ -527,11 +592,18 @@ while True:
     # Apply pending exercise change from /exercise endpoint
     with exercise_lock:
         if exercise_change["pending"]:
-            exercise    = exercise_change["value"]
-            rep_count   = 0
-            rep_state   = "up" if exercise == 2 else "down"
-            _ema_metric = 0.0
-            _last_rep_t = 0.0
+            exercise          = exercise_change["value"]
+            rep_count         = 0
+            rep_state         = "up" if exercise == 2 else "down"
+            _ema_metric       = 0.0
+            _last_rep_t       = 0.0
+            rep_phase         = "idle"
+            phase_frame_count = 0
+            last_alert_time   = {}
+            history_idx       = 0
+            prev_kps          = [(0, 0)] * 14
+            for _fi in range(5):
+                kps_history[_fi] = [(0, 0)] * 14
             exercise_change["pending"] = False
 
     ti = time.time()
@@ -561,6 +633,37 @@ while True:
         y = int(np.clip(coords[2*i+1] * DISPLAY_H / INPUT_H, 0, DISPLAY_H - 1))
         kps.append((x, y))
 
+    # Temporal smoothing — 5-frame history buffer
+    kps_history[history_idx] = kps[:]
+    history_idx = (history_idx + 1) % 5
+    smoothed_kps = []
+    for _k in range(14):
+        _avg_x = int(sum(kps_history[_f][_k][0] for _f in range(5)) / 5)
+        _avg_y = int(sum(kps_history[_f][_k][1] for _f in range(5)) / 5)
+        smoothed_kps.append((_avg_x, _avg_y))
+    for _i in range(14):
+        joint_velocities[_i] = float(np.sqrt(
+            (smoothed_kps[_i][0] - prev_kps[_i][0])**2 +
+            (smoothed_kps[_i][1] - prev_kps[_i][1])**2))
+    max_velocity = max(joint_velocities)
+    prev_kps = smoothed_kps[:]
+    kps = smoothed_kps
+
+    # Phase detection
+    if max_velocity > MOVEMENT_THRESHOLD:
+        if rep_phase == "idle":
+            rep_phase = "active"
+            phase_frame_count = 0
+        phase_frame_count += 1
+    else:
+        if rep_phase == "active" and phase_frame_count > 5:
+            rep_phase = "returning"
+        elif rep_phase == "returning":
+            rep_phase = "idle"
+            phase_frame_count = 0
+        else:
+            rep_phase = "idle"
+
     # FPS
     fc += 1
     elapsed = time.time() - t_fps
@@ -569,8 +672,10 @@ while True:
         fc    = 0
         t_fps = time.time()
 
-    # ── Posture + rep counting (fully inline, no function calls) ──────────────
-    alerts = []
+    # ── Posture + rep counting (phase-aware, cooldown-gated) ──────────────────
+    alerts       = []
+    instructions = []
+    now = time.time()
     if len(kps) == 14:
 
         if exercise == 1:  # Bicep Curl ───────────────────────────────────────
@@ -578,61 +683,81 @@ while True:
             _bc = np.array(kps[2]) - np.array(kps[1])
             _ang = float(np.degrees(np.arccos(np.clip(
                 np.dot(_ba, _bc) / (np.linalg.norm(_ba) * np.linalg.norm(_bc) + 1e-6), -1, 1))))
-            if abs(kps[1][0] - kps[0][0]) > 40:
-                alerts.append("Keep elbow pinned to side")
-            if _ang > 150:
-                alerts.append("Full range of motion")
-            # Rep: angle-based with EMA smoothing + cooldown (position-independent)
+            instructions = ["Keep elbow pinned to side", "Full range of motion"]
+            if rep_phase == "active":
+                if kps[1][0] > kps[0][0] + 40:
+                    _at = "Pin your elbow to your body"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                if _ang > 150:
+                    _at = "Curl more — squeeze the bicep"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                if max_velocity > 30:
+                    _at = "Slow down — control the curl"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
             _ema_metric = 0.35 * _ang + 0.65 * _ema_metric
             if rep_state == "down" and _ema_metric < 70:
                 rep_state = "up"
             elif rep_state == "up" and _ema_metric > 140 and (time.time() - _last_rep_t) > 0.5:
-                rep_state = "down"
-                rep_count += 1
-                _last_rep_t = time.time()
+                rep_state = "down"; rep_count += 1; _last_rep_t = time.time()
 
         elif exercise == 2:  # Squat ──────────────────────────────────────────
             _ba = np.array(kps[6]) - np.array(kps[7])
             _bc = np.array(kps[8]) - np.array(kps[7])
             _ang = float(np.degrees(np.arccos(np.clip(
                 np.dot(_ba, _bc) / (np.linalg.norm(_ba) * np.linalg.norm(_bc) + 1e-6), -1, 1))))
-            if _ang > 120:
-                alerts.append("Squat deeper")
-            if kps[7][0] < kps[6][0] - 25:
-                alerts.append("R knee caving in")
-            if kps[10][0] > kps[9][0] + 25:
-                alerts.append("L knee caving in")
-            if kps[13][1] > kps[6][1] + 20:
-                alerts.append("Keep chest up")
-            # Rep: knee angle-based with EMA smoothing + cooldown (position-independent)
+            instructions = ["Feet shoulder width apart", "Keep chest up"]
+            if rep_phase == "active":
+                if kps[7][0] < kps[6][0] - 25:
+                    _at = "Push right knee outward"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                if kps[10][0] > kps[9][0] + 25:
+                    _at = "Push left knee outward"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                if kps[13][1] > kps[6][1] + 20:
+                    _at = "Keep chest up — back rounding"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                if max_velocity > 30:
+                    _at = "Slow down — control the squat"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
             _ema_metric = 0.35 * _ang + 0.65 * _ema_metric
             if rep_state == "up" and _ema_metric < 110:
                 rep_state = "down"
             elif rep_state == "down" and _ema_metric > 155 and (time.time() - _last_rep_t) > 0.5:
-                rep_state = "up"
-                rep_count += 1
-                _last_rep_t = time.time()
+                rep_state = "up"; rep_count += 1; _last_rep_t = time.time()
 
         elif exercise == 3:  # Lateral Raise ───────────────────────────────────
-            _ba = np.array(kps[0]) - np.array(kps[1])
-            _bc = np.array(kps[2]) - np.array(kps[1])
-            _ang = float(np.degrees(np.arccos(np.clip(
-                np.dot(_ba, _bc) / (np.linalg.norm(_ba) * np.linalg.norm(_bc) + 1e-6), -1, 1))))
-            if kps[1][1] > kps[0][1] + 30:
-                alerts.append("Raise to shoulder height")
-            if kps[1][1] < kps[0][1] - 40:
-                alerts.append("Don't raise above shoulder")
-            if _ang > 170:
-                alerts.append("Keep slight bend in elbow")
-            # Rep: elbow-shoulder y gap, EMA smoothed + cooldown (position-independent)
-            # positive = elbow below shoulder, ~0 or negative = elbow at/above shoulder
+            instructions = ["Raise arms to shoulder height", "Slight bend in elbow"]
+            if rep_phase == "active":
+                if kps[1][1] > kps[0][1] + 40:
+                    _at = "Raise higher — not at shoulder level yet"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                if kps[1][1] < kps[0][1] - 50:
+                    _at = "Too high — stop at shoulder level"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                _left_raise  = kps[0][1] - kps[4][1]
+                _right_raise = kps[0][1] - kps[1][1]
+                if abs(_left_raise - _right_raise) > 40:
+                    _at = "Raise both arms evenly"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
+                if max_velocity > 35:
+                    _at = "Slow down — control the movement"
+                    if now - last_alert_time.get(_at, 0) > ALERT_COOLDOWN:
+                        alerts.append(_at); last_alert_time[_at] = now
             _ema_metric = 0.35 * (kps[1][1] - kps[0][1]) + 0.65 * _ema_metric
             if rep_state == "down" and _ema_metric < 15:
                 rep_state = "up"
             elif rep_state == "up" and _ema_metric > 55 and (time.time() - _last_rep_t) > 0.5:
-                rep_state = "down"
-                rep_count += 1
-                _last_rep_t = time.time()
+                rep_state = "down"; rep_count += 1; _last_rep_t = time.time()
 
     # IMU fusion — append sensor-derived alerts
     with imu_lock:
@@ -657,9 +782,12 @@ while True:
 
     # Publish live state for /status endpoint
     with live_lock:
-        live_state["exercise"]  = exercise
-        live_state["rep_count"] = rep_count
-        live_state["alerts"]    = alerts
+        live_state["exercise"]     = exercise
+        live_state["rep_count"]    = rep_count
+        live_state["alerts"]       = alerts
+        live_state["instructions"] = instructions
+        live_state["phase"]        = rep_phase
+        live_state["velocity"]     = round(max_velocity, 1)
 
     # ── Draw (inline, reuse display buffer) ───────────────────────────────────
     cv2.resize(frame, (DISPLAY_W, DISPLAY_H), dst=display)
@@ -679,23 +807,37 @@ while True:
     cv2.putText(display, str(rep_count),
                 (DISPLAY_W - 80, 62), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 220, 0), 3)
 
-    # Info line: FPS / latency / IMU values + band connection status
+    # Info line (just below top bar)
     _band_str = "Band: CONNECTED"     if _imu_ts > 0 else "Band: NOT CONNECTED"
     _band_col = (0, 220, 0)           if _imu_ts > 0 else (0, 220, 220)
     cv2.putText(display, f"FPS:{fps:.1f} {ms:.1f}ms  ACC:{_ax:.1f},{_imu_ay:.1f}  GYRO:{_gz:.0f}  T:{_tp:.1f}C",
-                (10, DISPLAY_H - 67), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
     cv2.putText(display, _band_str,
-                (430, DISPLAY_H - 67), cv2.FONT_HERSHEY_SIMPLEX, 0.35, _band_col, 1)
+                (430, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.35, _band_col, 1)
 
-    # Bottom bar (60px): green = good form, red = first alert
+    # Phase + velocity indicator
+    cv2.putText(display, f"Phase: {rep_phase}  Vel: {max_velocity:.0f}px/f",
+                (10, DISPLAY_H - 95), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+    # Instructions bar — always visible, subtle grey
+    cv2.rectangle(display, (0, DISPLAY_H - 90), (DISPLAY_W, DISPLAY_H - 55), (40, 40, 40), -1)
+    if instructions:
+        cv2.putText(display, " | ".join(instructions), (10, DISPLAY_H - 63),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1)
+
+    # Alert bar — phase-aware
     if alerts:
-        cv2.rectangle(display, (0, DISPLAY_H - 60), (DISPLAY_W, DISPLAY_H), (0, 0, 180), -1)
-        cv2.putText(display, alerts[0],
-                    (10, DISPLAY_H - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.rectangle(display, (0, DISPLAY_H - 55), (DISPLAY_W, DISPLAY_H), (0, 0, 180), -1)
+        cv2.putText(display, alerts[0], (10, DISPLAY_H - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+    elif rep_phase == "active":
+        cv2.rectangle(display, (0, DISPLAY_H - 55), (DISPLAY_W, DISPLAY_H), (0, 120, 0), -1)
+        cv2.putText(display, "Good form!", (10, DISPLAY_H - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
     else:
-        cv2.rectangle(display, (0, DISPLAY_H - 60), (DISPLAY_W, DISPLAY_H), (0, 140, 0), -1)
-        cv2.putText(display, "GOOD FORM",
-                    (10, DISPLAY_H - 18), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        cv2.rectangle(display, (0, DISPLAY_H - 55), (DISPLAY_W, DISPLAY_H), (30, 30, 30), -1)
+        cv2.putText(display, "Ready", (10, DISPLAY_H - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (100, 100, 100), 2)
 
     # Push annotated frame to MJPEG stream
     with frame_lock:
