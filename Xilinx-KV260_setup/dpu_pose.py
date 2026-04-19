@@ -31,6 +31,7 @@ NAMES = [
     "Head","Neck"
 ]
 MEAN = np.array([104., 117., 123.], dtype=np.float32)
+EXERCISE_NAMES = {1: "Bicep Curl", 2: "Squat", 3: "Lateral Raise"}
 
 # ── Load runners ──────────────────────────────────────────────────────────────
 graph = xir.Graph.deserialize(XMODEL_PATH)
@@ -56,16 +57,38 @@ out_data2 = np.ascontiguousarray(np.zeros([1, 28],           dtype=np.int8))
 display   = np.ascontiguousarray(np.zeros([DISPLAY_H, DISPLAY_W, 3], dtype=np.uint8))
 print("[INFO] Buffers pre-allocated")
 
+# ── Exercise selection screen ─────────────────────────────────────────────────
+_sel = np.zeros((320, 520, 3), dtype=np.uint8)
+_sel[:] = (30, 30, 30)
+cv2.putText(_sel, "Select Exercise",      ( 75,  60), cv2.FONT_HERSHEY_SIMPLEX, 1.1,  (0, 255, 255), 2)
+cv2.putText(_sel, "1  -  Bicep Curl",    (100, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9,  (255, 255, 255), 2)
+cv2.putText(_sel, "2  -  Squat",         (100, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.9,  (255, 255, 255), 2)
+cv2.putText(_sel, "3  -  Lateral Raise", (100, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.9,  (255, 255, 255), 2)
+cv2.putText(_sel, "Press key to begin",  ( 90, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 100),  2)
+cv2.imshow("Select Exercise", _sel)
+
+exercise = 0
+while exercise == 0:
+    _k = cv2.waitKey(100) & 0xFF
+    if   _k == ord('1'): exercise = 1
+    elif _k == ord('2'): exercise = 2
+    elif _k == ord('3'): exercise = 3
+cv2.destroyWindow("Select Exercise")
+
 # ── Camera ────────────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(CAMERA_INDEX)
 assert cap.isOpened(), "Camera not found"
 print(f"[INFO] Camera: {int(cap.get(3))}x{int(cap.get(4))}")
-print("[INFO] Running — press 'q' to quit\n")
+print(f"[INFO] Exercise: {EXERCISE_NAMES[exercise]}")
+print("[INFO] Running — press 'q' to quit, 'r' to reset reps\n")
 
-fps    = 0.0
-fc     = 0
-t0     = time.time()
-t_fps  = time.time()
+fps   = 0.0
+fc    = 0
+t_fps = time.time()
+
+# Rep counter state (pre-allocated outside loop)
+rep_count = 0
+rep_state = "up" if exercise == 2 else "down"
 
 # ── Main loop (everything inline) ─────────────────────────────────────────────
 while True:
@@ -94,9 +117,9 @@ while True:
 
     # Decode keypoints
     kps = []
-    for k in range(14):
-        x = int(np.clip(coords[2*k]   * DISPLAY_W / INPUT_W, 0, DISPLAY_W - 1))
-        y = int(np.clip(coords[2*k+1] * DISPLAY_H / INPUT_H, 0, DISPLAY_H - 1))
+    for i in range(14):
+        x = int(np.clip(coords[2*i]   * DISPLAY_W / INPUT_W, 0, DISPLAY_W - 1))
+        y = int(np.clip(coords[2*i+1] * DISPLAY_H / INPUT_H, 0, DISPLAY_H - 1))
         kps.append((x, y))
 
     # FPS
@@ -107,23 +130,68 @@ while True:
         fc    = 0
         t_fps = time.time()
 
-    # Posture analysis (inline)
+    # ── Posture + rep counting (fully inline, no function calls) ──────────────
     alerts = []
     if len(kps) == 14:
-        def _ang(a, b, c):
-            ba  = np.array(a) - np.array(b)
-            bc  = np.array(c) - np.array(b)
-            cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
-            return float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
-        if _ang(kps[6], kps[7],  kps[8])  > 175: alerts.append("WARNING: R knee hyperextension")
-        if _ang(kps[9], kps[10], kps[11]) > 175: alerts.append("WARNING: L knee hyperextension")
-        if _ang(kps[6], kps[7],  kps[8])  <  70: alerts.append("WARNING: Deep squat - check alignment")
-        if _ang(kps[0], kps[1],  kps[2])  > 170: alerts.append("WARNING: R elbow locked out")
-        if _ang(kps[3], kps[4],  kps[5])  > 170: alerts.append("WARNING: L elbow locked out")
-        if abs(kps[0][1] - kps[3][1])     >  30: alerts.append("WARNING: Uneven shoulders")
-        if abs(kps[6][1] - kps[9][1])     >  30: alerts.append("WARNING: Uneven hips")
 
-    # Draw (inline, reuse display buffer)
+        if exercise == 1:  # Bicep Curl ───────────────────────────────────────
+            _ba = np.array(kps[0]) - np.array(kps[1])
+            _bc = np.array(kps[2]) - np.array(kps[1])
+            _ang = float(np.degrees(np.arccos(np.clip(
+                np.dot(_ba, _bc) / (np.linalg.norm(_ba) * np.linalg.norm(_bc) + 1e-6), -1, 1))))
+            if abs(kps[1][0] - kps[0][0]) > 40:
+                alerts.append("Keep elbow pinned to side")
+            if _ang > 150:
+                alerts.append("Full range of motion")
+            # Rep: wrist y < 200 = top, > 280 = bottom
+            _wy = kps[2][1]
+            if rep_state == "down" and _wy < 200:
+                rep_state = "up"
+            elif rep_state == "up" and _wy > 280:
+                rep_state = "down"
+                rep_count += 1
+
+        elif exercise == 2:  # Squat ──────────────────────────────────────────
+            _ba = np.array(kps[6]) - np.array(kps[7])
+            _bc = np.array(kps[8]) - np.array(kps[7])
+            _ang = float(np.degrees(np.arccos(np.clip(
+                np.dot(_ba, _bc) / (np.linalg.norm(_ba) * np.linalg.norm(_bc) + 1e-6), -1, 1))))
+            if _ang > 120:
+                alerts.append("Squat deeper")
+            if kps[7][0] < kps[6][0] - 25:
+                alerts.append("R knee caving in")
+            if kps[10][0] > kps[9][0] + 25:
+                alerts.append("L knee caving in")
+            if kps[13][1] > kps[6][1] + 20:
+                alerts.append("Keep chest up")
+            # Rep: avg hip y > 300 = bottom, < 220 = standing
+            _hy = (kps[6][1] + kps[9][1]) / 2.0
+            if rep_state == "up" and _hy > 300:
+                rep_state = "down"
+            elif rep_state == "down" and _hy < 220:
+                rep_state = "up"
+                rep_count += 1
+
+        elif exercise == 3:  # Lateral Raise ───────────────────────────────────
+            _ba = np.array(kps[0]) - np.array(kps[1])
+            _bc = np.array(kps[2]) - np.array(kps[1])
+            _ang = float(np.degrees(np.arccos(np.clip(
+                np.dot(_ba, _bc) / (np.linalg.norm(_ba) * np.linalg.norm(_bc) + 1e-6), -1, 1))))
+            if kps[1][1] > kps[0][1] + 30:
+                alerts.append("Raise to shoulder height")
+            if kps[1][1] < kps[0][1] - 40:
+                alerts.append("Don't raise above shoulder")
+            if _ang > 170:
+                alerts.append("Keep slight bend in elbow")
+            # Rep: elbow y < 200 = raised, > 280 = lowered
+            _ey = kps[1][1]
+            if rep_state == "down" and _ey < 200:
+                rep_state = "up"
+            elif rep_state == "up" and _ey > 280:
+                rep_state = "down"
+                rep_count += 1
+
+    # ── Draw (inline, reuse display buffer) ───────────────────────────────────
     cv2.resize(frame, (DISPLAY_W, DISPLAY_H), dst=display)
     for a, b in SKELETON:
         cv2.line(display, kps[a], kps[b], (0, 255, 0), 2)
@@ -131,20 +199,38 @@ while True:
         cv2.circle(display, (x, y), 5, (255, 0, 0), -1)
         cv2.putText(display, NAMES[idx], (x+4, y-4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
+
+    # Top bar: exercise name + rep count
+    cv2.rectangle(display, (0, 0), (DISPLAY_W, 48), (0, 0, 0), -1)
+    cv2.putText(display, f"{EXERCISE_NAMES[exercise]}   Reps: {rep_count}",
+                (10, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+    # FPS / latency line
     cv2.putText(display, f"FPS:{fps:.1f}  {ms:.1f}ms  DPUCZDX8G-B4096",
-                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-    for i, a in enumerate(alerts):
-        cv2.putText(display, a, (10, DISPLAY_H - 15 - i*26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 50, 255), 2)
+                (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    # Bottom bar: form status
+    if alerts:
+        cv2.rectangle(display, (0, DISPLAY_H - 52), (DISPLAY_W, DISPLAY_H), (0, 0, 180), -1)
+        cv2.putText(display, alerts[0],
+                    (10, DISPLAY_H - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+    else:
+        cv2.rectangle(display, (0, DISPLAY_H - 52), (DISPLAY_W, DISPLAY_H), (0, 140, 0), -1)
+        cv2.putText(display, "GOOD FORM",
+                    (10, DISPLAY_H - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
     cv2.imshow("KV260 DPU Pose", display)
 
     if fc % 30 == 1:
-        print(f"[PERF] {ms:.1f}ms | FPS:{fps:.1f} | alerts:{alerts}")
+        print(f"[PERF] {ms:.1f}ms | FPS:{fps:.1f} | reps:{rep_count} | alerts:{alerts}")
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    _key = cv2.waitKey(1) & 0xFF
+    if _key == ord('q'):
         break
+    elif _key == ord('r'):
+        rep_count = 0
+        rep_state = "up" if exercise == 2 else "down"
 
 cap.release()
 cv2.destroyAllWindows()
-print("[INFO] Done.")
+print(f"[INFO] Done. Final reps: {rep_count}")
