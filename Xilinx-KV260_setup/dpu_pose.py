@@ -171,19 +171,326 @@ def video_feed():
 
 @app.route('/')
 def index():
-    return '''<html>
+    return '''<!DOCTYPE html>
+<html lang="en">
 <head>
-  <title>KV260 Pose Monitor</title>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>KV260 Fitness Monitor</title>
   <style>
-    body { background: #111; color: white; font-family: Arial; text-align: center; margin: 0; padding: 20px; }
-    img  { width: 100%; max-width: 800px; border: 2px solid #333; }
-    h2   { color: #0f0; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d0d0d;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      padding: 12px 20px;
+      background: #111;
+      border-bottom: 1px solid #222;
+      font-size: 13px;
+      color: #555;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+    header span { color: #0af; }
+
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: row;
+      overflow: hidden;
+    }
+
+    /* ── Video panel (left 70%) ─────────────────────── */
+    .video-panel {
+      flex: 7;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 0;
+    }
+    .video-panel img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    /* ── Side panel (right 30%) ─────────────────────── */
+    .side-panel {
+      flex: 3;
+      background: #111;
+      border-left: 1px solid #1e1e1e;
+      display: flex;
+      flex-direction: column;
+      padding: 20px 16px;
+      gap: 16px;
+      overflow-y: auto;
+      min-width: 220px;
+    }
+
+    .card {
+      background: #181818;
+      border-radius: 10px;
+      padding: 14px 16px;
+      border: 1px solid #222;
+    }
+    .card-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      color: #555;
+      margin-bottom: 6px;
+    }
+
+    #exercise-name {
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+    .ex-squat        { color: #4fc3f7; }
+    .ex-bicep_curl   { color: #ffb74d; }
+    .ex-lateral_raise{ color: #81c784; }
+    .ex-none         { color: #555; }
+
+    #rep-count {
+      font-size: 72px;
+      font-weight: 800;
+      color: #fff;
+      line-height: 1;
+      text-align: center;
+    }
+
+    #alerts-list { display: flex; flex-direction: column; gap: 6px; min-height: 20px; }
+    .alert-card {
+      background: #3a0d0d;
+      border: 1px solid #c62828;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: #ff8a80;
+    }
+    .no-alert {
+      font-size: 12px;
+      color: #2e7d32;
+    }
+
+    .band-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-on  { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+    .dot-off { background: #444; }
+
+    .imu-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 10px;
+      font-size: 11px;
+      color: #888;
+    }
+    .imu-grid span { color: #ccc; }
+
+    .stats-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: #666;
+    }
+    .stats-row span { color: #aaa; }
+
+    /* ── Exercise buttons ───────────────────────────── */
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px;
+      background: #0d0d0d;
+      border-top: 1px solid #1e1e1e;
+      flex-wrap: wrap;
+    }
+    .ex-btn {
+      flex: 1;
+      min-width: 100px;
+      padding: 12px 8px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+      letter-spacing: 0.3px;
+    }
+    .ex-btn:active { transform: scale(0.96); }
+    .btn-squat  { background: #0d3a4f; color: #4fc3f7; border: 1px solid #4fc3f7; }
+    .btn-curl   { background: #3e2a00; color: #ffb74d; border: 1px solid #ffb74d; }
+    .btn-raise  { background: #1b3620; color: #81c784; border: 1px solid #81c784; }
+    .ex-btn:hover { opacity: 0.8; }
+
+    /* ── Mobile responsive ──────────────────────────── */
+    @media (max-width: 700px) {
+      .main { flex-direction: column; }
+      .video-panel { flex: none; height: 55vw; }
+      .side-panel  { flex: none; border-left: none; border-top: 1px solid #1e1e1e; }
+      #rep-count   { font-size: 52px; }
+    }
   </style>
 </head>
 <body>
-  <h2>KV260 DPU Pose Estimation</h2>
-  <img src="/video" /><br><br>
-  <a href="/status" style="color:#0af">System Status</a>
+  <header>KV260 &nbsp;/&nbsp; <span>DPU Pose Monitor</span> &nbsp;/&nbsp; FPGA Inference</header>
+
+  <div class="main">
+    <!-- Live video -->
+    <div class="video-panel">
+      <img src="/video" alt="Live pose stream"/>
+    </div>
+
+    <!-- Side panel -->
+    <div class="side-panel">
+
+      <div class="card">
+        <div class="card-label">Exercise</div>
+        <div id="exercise-name" class="ex-none">—</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Reps</div>
+        <div id="rep-count">0</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Form Alerts</div>
+        <div id="alerts-list"><span class="no-alert">&#10003; Good form</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Wearable Band</div>
+        <div class="band-row">
+          <div class="dot dot-off" id="band-dot"></div>
+          <span id="band-label">Not connected</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">IMU Readings</div>
+        <div class="imu-grid">
+          <div>Accel X</div><div><span id="ax">—</span></div>
+          <div>Accel Y</div><div><span id="ay">—</span></div>
+          <div>Accel Z</div><div><span id="az">—</span></div>
+          <div>Gyro X</div><div><span id="gx">—</span></div>
+          <div>Gyro Y</div><div><span id="gy">—</span></div>
+          <div>Gyro Z</div><div><span id="gz">—</span></div>
+          <div>Temp</div><div><span id="temp">—</span></div>
+          <div>Humidity</div><div><span id="hum">—</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Performance</div>
+        <div class="stats-row">
+          <div>FPS</div><div><span id="fps">—</span></div>
+        </div>
+        <div class="stats-row" style="margin-top:4px">
+          <div>Latency</div><div><span id="latency">—</span></div>
+        </div>
+      </div>
+
+    </div><!-- /side-panel -->
+  </div><!-- /main -->
+
+  <div class="btn-row">
+    <button class="ex-btn btn-squat" onclick="setExercise('squat')">&#9675; Squat</button>
+    <button class="ex-btn btn-curl"  onclick="setExercise('bicep_curl')">&#9675; Bicep Curl</button>
+    <button class="ex-btn btn-raise" onclick="setExercise('lateral_raise')">&#9675; Lateral Raise</button>
+  </div>
+
+  <script>
+    const EXERCISE_LABELS = {
+      squat: "Squat",
+      bicep_curl: "Bicep Curl",
+      lateral_raise: "Lateral Raise",
+      none: "—"
+    };
+    const EX_CLASS = {
+      squat: "ex-squat",
+      bicep_curl: "ex-bicep_curl",
+      lateral_raise: "ex-lateral_raise",
+      none: "ex-none"
+    };
+
+    async function poll() {
+      try {
+        const r = await fetch("/status");
+        const d = await r.json();
+
+        // Exercise name
+        const exKey = String(d.exercise);
+        const nameEl = document.getElementById("exercise-name");
+        nameEl.textContent = EXERCISE_LABELS[exKey] || exKey;
+        nameEl.className = EX_CLASS[exKey] || "ex-none";
+
+        // Rep count
+        document.getElementById("rep-count").textContent = d.reps ?? 0;
+
+        // Alerts
+        const alertsEl = document.getElementById("alerts-list");
+        if (d.alerts && d.alerts.length) {
+          alertsEl.innerHTML = d.alerts
+            .map(a => `<div class="alert-card">&#9888; ${a}</div>`)
+            .join("");
+        } else {
+          alertsEl.innerHTML = '<span class="no-alert">&#10003; Good form</span>';
+        }
+
+        // Band status
+        const connected = d.imu && d.imu.timestamp > 0;
+        document.getElementById("band-dot").className = "dot " + (connected ? "dot-on" : "dot-off");
+        document.getElementById("band-label").textContent = connected ? "Connected" : "Not connected";
+
+        // IMU
+        if (d.imu) {
+          const a = d.imu.accel || {}, g = d.imu.gyro || {};
+          document.getElementById("ax").textContent   = (a.x ?? 0).toFixed(3) + " g";
+          document.getElementById("ay").textContent   = (a.y ?? 0).toFixed(3) + " g";
+          document.getElementById("az").textContent   = (a.z ?? 0).toFixed(3) + " g";
+          document.getElementById("gx").textContent   = (g.x ?? 0).toFixed(1) + " °/s";
+          document.getElementById("gy").textContent   = (g.y ?? 0).toFixed(1) + " °/s";
+          document.getElementById("gz").textContent   = (g.z ?? 0).toFixed(1) + " °/s";
+          document.getElementById("temp").textContent = (d.imu.temp ?? 0).toFixed(1) + " °C";
+          document.getElementById("hum").textContent  = (d.imu.humidity ?? 0).toFixed(1) + " %";
+        }
+
+        // Stats — served from status if present, otherwise blank
+        if (d.fps != null)     document.getElementById("fps").textContent     = d.fps.toFixed(1);
+        if (d.latency != null) document.getElementById("latency").textContent = d.latency.toFixed(1) + " ms";
+
+      } catch(e) { /* board unreachable — keep last values */ }
+    }
+
+    async function setExercise(name) {
+      await fetch("/exercise", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ exercise: name })
+      });
+    }
+
+    poll();
+    setInterval(poll, 500);
+  </script>
 </body>
 </html>'''
 
