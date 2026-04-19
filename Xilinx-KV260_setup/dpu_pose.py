@@ -167,13 +167,14 @@ while True:
                 alerts.append("L knee caving in")
             if kps[13][1] > kps[6][1] + 20:
                 alerts.append("Keep chest up")
-            # Rep: avg hip y > 300 = bottom, < 220 = standing
-            _hy = (kps[6][1] + kps[9][1]) / 2.0
-            if rep_state == "up" and _hy > 300:
+            # Rep: knee angle-based with EMA smoothing + cooldown (position-independent)
+            _ema_metric = 0.35 * _ang + 0.65 * _ema_metric
+            if rep_state == "up" and _ema_metric < 110:
                 rep_state = "down"
-            elif rep_state == "down" and _hy < 220:
+            elif rep_state == "down" and _ema_metric > 155 and (time.time() - _last_rep_t) > 0.5:
                 rep_state = "up"
                 rep_count += 1
+                _last_rep_t = time.time()
 
         elif exercise == 3:  # Lateral Raise ───────────────────────────────────
             _ba = np.array(kps[0]) - np.array(kps[1])
