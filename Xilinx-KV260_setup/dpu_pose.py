@@ -11,6 +11,8 @@ import numpy as np
 import xir
 import vart
 import time
+from flask import Flask, request, jsonify
+import threading
 
 # ── Config ────────────────────────────────────────────────────────────────────
 XMODEL_PATH = "/home/ubuntu/sp_net/sp_net.xmodel"
@@ -57,6 +59,19 @@ out_data2 = np.ascontiguousarray(np.zeros([1, 28],           dtype=np.int8))
 display   = np.ascontiguousarray(np.zeros([DISPLAY_H, DISPLAY_W, 3], dtype=np.uint8))
 print("[INFO] Buffers pre-allocated")
 
+# ── Shared Flask state ────────────────────────────────────────────────────────
+latest_imu = {
+    "accel": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "gyro":  {"x": 0.0, "y": 0.0, "z": 0.0},
+    "temp":  0.0,
+    "humidity": 0.0,
+    "timestamp": 0
+}
+vibrate_command = {"vibrate": False, "pattern": "none", "reason": ""}
+imu_lock = threading.Lock()
+vib_lock = threading.Lock()
+alerts   = []   # pre-init so /status works before main loop runs
+
 # ── Exercise selection screen ─────────────────────────────────────────────────
 _sel = np.zeros((320, 520, 3), dtype=np.uint8)
 _sel[:] = (30, 30, 30)
@@ -91,6 +106,68 @@ rep_count = 0
 rep_state = "up" if exercise == 2 else "down"
 _ema_metric = 0.0   # EMA of angle (curl) or relative elbow-shoulder gap (raise)
 _last_rep_t = 0.0   # cooldown: min 0.5s between reps
+
+# ── Flask sensor server ───────────────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route('/imu', methods=['POST'])
+def post_imu():
+    data = request.get_json(silent=True) or {}
+    with imu_lock:
+        latest_imu["accel"]     = data.get("accel",     latest_imu["accel"])
+        latest_imu["gyro"]      = data.get("gyro",      latest_imu["gyro"])
+        latest_imu["temp"]      = float(data.get("temp",     latest_imu["temp"]))
+        latest_imu["humidity"]  = float(data.get("humidity", latest_imu["humidity"]))
+        latest_imu["timestamp"] = data.get("timestamp", latest_imu["timestamp"])
+    return jsonify({"status": "ok"})
+
+@app.route('/vibrate', methods=['GET'])
+def get_vibrate():
+    with vib_lock:
+        resp = dict(vibrate_command)
+        vibrate_command["vibrate"] = False
+    return jsonify(resp)
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    with imu_lock:
+        imu_snap = {
+            "accel":     dict(latest_imu["accel"]),
+            "gyro":      dict(latest_imu["gyro"]),
+            "temp":      latest_imu["temp"],
+            "humidity":  latest_imu["humidity"],
+            "timestamp": latest_imu["timestamp"],
+        }
+    with vib_lock:
+        vib_snap = dict(vibrate_command)
+    return jsonify({
+        "imu":      imu_snap,
+        "vibrate":  vib_snap,
+        "exercise": exercise,
+        "reps":     rep_count,
+        "alerts":   alerts,
+    })
+
+@app.route('/exercise', methods=['POST'])
+def post_exercise():
+    global exercise, rep_count, rep_state, _ema_metric, _last_rep_t
+    data    = request.get_json(silent=True) or {}
+    mapping = {"bicep_curl": 1, "squat": 2, "lateral_raise": 3}
+    name    = data.get("exercise", "")
+    if name in mapping:
+        exercise    = mapping[name]
+        rep_count   = 0
+        rep_state   = "up" if exercise == 2 else "down"
+        _ema_metric = 0.0
+        _last_rep_t = 0.0
+    return jsonify({"status": "ok", "exercise": exercise})
+
+flask_thread = threading.Thread(
+    target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False, debug=False),
+    daemon=True
+)
+flask_thread.start()
+print("[INFO] Sensor server running on port 5000")
 
 # ── Main loop (everything inline) ─────────────────────────────────────────────
 while True:
@@ -197,6 +274,25 @@ while True:
                 rep_count += 1
                 _last_rep_t = time.time()
 
+    # Vibration command — fire if pose alerts exist
+    if alerts:
+        with vib_lock:
+            vibrate_command["vibrate"] = True
+            vibrate_command["pattern"] = "long" if len(alerts) > 1 else "short"
+            vibrate_command["reason"]  = alerts[0]
+
+    # IMU fusion — append sensor-derived alerts
+    with imu_lock:
+        _ax = latest_imu["accel"]["x"]
+        _gz = latest_imu["gyro"]["z"]
+        _tp = latest_imu["temp"]
+    if _ax > 0.4:
+        alerts.append("Excessive forward lean")
+    if abs(_gz) > 150:
+        alerts.append("Moving too fast")
+    if _tp > 38.5:
+        alerts.append("High body temp — rest")
+
     # ── Draw (inline, reuse display buffer) ───────────────────────────────────
     cv2.resize(frame, (DISPLAY_W, DISPLAY_H), dst=display)
     for a, b in SKELETON:
@@ -214,6 +310,10 @@ while True:
     # FPS / latency line
     cv2.putText(display, f"FPS:{fps:.1f}  {ms:.1f}ms  DPUCZDX8G-B4096",
                 (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    # IMU status line
+    cv2.putText(display, f"ACC:{latest_imu['accel']['x']:.1f},{latest_imu['accel']['y']:.1f} GYRO:{latest_imu['gyro']['z']:.0f} T:{latest_imu['temp']:.1f}C",
+                (10, DISPLAY_H - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
 
     # Bottom bar: form status
     if alerts:
