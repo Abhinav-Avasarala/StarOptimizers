@@ -106,8 +106,9 @@ sudo apt install xlnx-firmware-kv260-benchmark-b4096
 │  Scale to display resolution (640×480)                         │
 │       │                                                         │
 │       ▼                                                         │
-│  Posture analysis → injury alerts                              │
-│  Draw skeleton overlay → cv2.imshow                            │
+│  Posture analysis + rep counting → alerts                      │
+│  IMU fusion (accel/gyro/temp from wearable band)               │
+│  Annotate frame → MJPEG stream via Flask /video               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -203,21 +204,39 @@ for s in graph.get_root_subgraph().get_children():
 
 ```bash
 # Make sure overlay is loaded first (see Setup step 1)
-python3 dpu_pose.py
+sudo xmutil unloadapp
+sudo xmutil loadapp kv260-benchmark-b4096
+
+# Pass exercise as CLI argument
+python3 ~/dpu_pose.py bicep_curl
+python3 ~/dpu_pose.py squat
+python3 ~/dpu_pose.py lateral_raise
 ```
 
-Press `q` to quit.
+Then open a browser on any device on the same network:
+```
+http://<board-ip>:5000/        ← live annotated video stream
+http://<board-ip>:5000/status  ← JSON system status
+http://<board-ip>:5000/vibrate ← band vibration poll endpoint
+```
+
+The board prints its IP on startup. You can also try `http://kria.local:5000/` if mDNS is available.
+
+**Keyboard** (requires a terminal with the script in focus): `q` quit · `r` reset rep count.  
+**Remote exercise switch:** `POST /exercise` with `{"exercise": "squat"}`.
 
 ### Expected terminal output
 ```
+[INFO] Exercise selected: squat
 [INFO] Conv: subgraph_conv1/7x7_s2
 [INFO] FC:   subgraph_fc_coordinate_bias_new
 [INFO] Buffers pre-allocated
 [INFO] Camera: 1920x1080
-[INFO] Running — press 'q' to quit
+[INFO] Video stream: http://192.168.1.42:5000/
+[INFO] Or try:       http://kria.local:5000/
+[INFO] Exercise: Squat
 
-[PERF] 18.4ms | FPS:52.1 | alerts:[]
-[PERF] 19.1ms | FPS:51.8 | alerts:['WARNING: Uneven shoulders']
+[SUMMARY] Exercise:Squat Reps:3 Alerts:[] Band:disconnected Latency:19.2ms FPS:51.4
 ```
 
 ---
@@ -240,15 +259,38 @@ Index │ Joint          │ Index │ Joint
 
 ## Injury Detection Logic
 
-Joint angles are computed using the dot-product formula at each joint. Current checks:
+Joint angles are computed inline using the dot-product formula. Rules are exercise-specific. All rep counting uses EMA-smoothed angles with 0.5s cooldown (position-independent — works regardless of distance from camera).
 
+### Bicep Curl
 | Check | Condition | Alert |
 |---|---|---|
-| Knee hyperextension | angle > 175° | WARNING: R/L knee hyperextension |
-| Deep squat alignment | knee angle < 70° | WARNING: Deep squat - check alignment |
-| Elbow lockout | angle > 170° | WARNING: R/L elbow locked out |
-| Shoulder imbalance | height diff > 30px | WARNING: Uneven shoulders |
-| Hip imbalance | height diff > 30px | WARNING: Uneven hips |
+| Elbow swing | `kps[1].x` drifts >40px from `kps[0].x` | Keep elbow pinned to side |
+| Incomplete curl | R elbow angle > 150° | Full range of motion |
+| Rep counted when | EMA angle < 70° (up) → > 140° (down) | — |
+
+### Squat
+| Check | Condition | Alert |
+|---|---|---|
+| Depth | R knee angle > 120° | Squat deeper |
+| R knee cave | `kps[7].x` < `kps[6].x` − 25px | R knee caving in |
+| L knee cave | `kps[10].x` > `kps[9].x` + 25px | L knee caving in |
+| Back rounding | `kps[13].y` > `kps[6].y` + 20px | Keep chest up |
+| Rep counted when | EMA knee angle < 110° (down) → > 155° (up) | — |
+
+### Lateral Raise
+| Check | Condition | Alert |
+|---|---|---|
+| Too low | `kps[1].y` > `kps[0].y` + 30px | Raise to shoulder height |
+| Too high | `kps[1].y` < `kps[0].y` − 40px | Don't raise above shoulder |
+| Locked elbow | R elbow angle > 170° | Keep slight bend in elbow |
+| Rep counted when | EMA elbow-shoulder gap < 15px (up) → > 55px (down) | — |
+
+### IMU Fusion (wearable band)
+| Check | Condition | Alert |
+|---|---|---|
+| Forward lean | `accel.x` > 0.4g | Excessive forward lean |
+| Too fast | `\|gyro.z\|` > 150 °/s | Moving too fast |
+| Overheating | `temp` > 38.5°C | High body temp — rest |
 
 ---
 
@@ -314,8 +356,12 @@ Do not set `CAP_PROP_FRAME_WIDTH/HEIGHT` to 640×480 — it fights the GStreamer
 ## What's Next
 
 - [ ] Tune posture angle thresholds with real gym footage
-- [ ] Add rep counter (squat, deadlift, bench) using joint trajectory tracking  
+- [x] Add rep counter (squat, bicep curl, lateral raise) — angle-based with EMA smoothing
+- [x] Add posture alerts per exercise (squat, bicep curl, lateral raise)
+- [x] Flask API server with /imu, /vibrate, /status, /exercise endpoints
+- [x] IMU fusion (accel/gyro/temp from wearable band over HTTP)
+- [x] MJPEG video stream — view in browser, no monitor needed
 - [ ] Try `kv260-aibox-reid` overlay which includes camera ISP pipeline
 - [ ] Evaluate `openpose_pruned` xmodel for better accuracy
-- [ ] Add mobile UI to receive posture alerts over WebSocket
 - [ ] Fine-tune sp_net on gym-specific pose dataset for better accuracy on exercise positions
+- [ ] Add deadlift and overhead press exercise rules
