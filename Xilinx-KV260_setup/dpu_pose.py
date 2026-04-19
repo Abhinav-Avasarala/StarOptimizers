@@ -11,6 +11,7 @@ import numpy as np
 import xir
 import vart
 import time
+import requests
 from flask import Flask, request, jsonify, Response
 import threading
 import socket
@@ -89,6 +90,12 @@ live_state      = {"exercise": "none", "rep_count": 0, "alerts": [], "instructio
 live_lock       = threading.Lock()
 exercise_change = {"pending": False, "value": 0}
 exercise_lock   = threading.Lock()
+
+# ── Band communication ────────────────────────────────────────────────────────
+BAND_RIGHT       = "http://172.20.10.14"
+BAND_LEFT        = "http://172.20.10.13"
+BAND_TIMEOUT     = 0.3
+band_status      = {"right": False, "left": False}
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -645,6 +652,47 @@ def post_exercise():
         cur = live_state["exercise"]
     return jsonify({"status": "ok", "exercise": cur})
 
+def call_band(url):
+    try:
+        requests.get(url, timeout=BAND_TIMEOUT)
+    except Exception:
+        pass
+
+def vibrate_band(pattern, hand="both"):
+    """pattern: 'buzz', 'warn', 'on', 'off'"""
+    if hand in ("right", "both"):
+        threading.Thread(target=call_band, args=(f"{BAND_RIGHT}/{pattern}",), daemon=True).start()
+    if hand in ("left", "both"):
+        threading.Thread(target=call_band, args=(f"{BAND_LEFT}/{pattern}",), daemon=True).start()
+
+def poll_band_sensors():
+    while True:
+        try:
+            r = requests.get(f"{BAND_RIGHT}/data", timeout=0.5)
+            data = r.json()
+            with imu_lock:
+                latest_imu["accel"]     = data.get("accel",    latest_imu["accel"])
+                latest_imu["gyro"]      = data.get("gyro",     latest_imu["gyro"])
+                latest_imu["temp"]      = float(data.get("temp",     latest_imu["temp"]))
+                latest_imu["humidity"]  = float(data.get("humidity", latest_imu["humidity"]))
+                latest_imu["timestamp"] = time.time()
+            band_status["right"] = True
+        except Exception:
+            band_status["right"] = False
+        try:
+            r2 = requests.get(f"{BAND_LEFT}/data", timeout=0.5)
+            data2 = r2.json()
+            with imu_lock:
+                latest_imu["accel_left"] = data2.get("accel", {})
+                latest_imu["gyro_left"]  = data2.get("gyro",  {})
+            band_status["left"] = True
+        except Exception:
+            band_status["left"] = False
+        time.sleep(0.2)
+
+threading.Thread(target=poll_band_sensors, daemon=True).start()
+print("[INFO] Band sensor polling started")
+
 flask_thread = threading.Thread(
     target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False, debug=False),
     daemon=True
@@ -791,6 +839,7 @@ while True:
                     _at = "Pin your elbow to your body"
                     _now_t = time.time()
                     if _now_t - last_alert_time.get("VIB_" + _at, 0) > 2.0:
+                        vibrate_band("warn", hand="right")
                         with vib_lock:
                             vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "long"
                             vibrate_command["reason"] = _at; vibrate_command["severity"] = "critical"
@@ -815,6 +864,8 @@ while True:
                     last_rep_feedback += f" (peak: {min(curl_angles_this_rep):.0f}deg)"
                 feedback_display_timer = time.time()
                 _non_crit = [a for a in rep_alerts_buffer if a not in CRITICAL_IMMEDIATE]
+                if _non_crit:
+                    vibrate_band("buzz", hand="both")
                 with vib_lock:
                     if _non_crit:
                         vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "short"
@@ -840,6 +891,7 @@ while True:
                     _at = "Push right knee outward"
                     _now_t = time.time()
                     if _now_t - last_alert_time.get("VIB_" + _at, 0) > 2.0:
+                        vibrate_band("warn", hand="both")
                         with vib_lock:
                             vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "long"
                             vibrate_command["reason"] = _at; vibrate_command["severity"] = "critical"
@@ -849,6 +901,7 @@ while True:
                     _at = "Push left knee outward"
                     _now_t = time.time()
                     if _now_t - last_alert_time.get("VIB_" + _at, 0) > 2.0:
+                        vibrate_band("warn", hand="both")
                         with vib_lock:
                             vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "long"
                             vibrate_command["reason"] = _at; vibrate_command["severity"] = "critical"
@@ -858,6 +911,7 @@ while True:
                     _at = "Keep chest up - back rounding"
                     _now_t = time.time()
                     if _now_t - last_alert_time.get("VIB_" + _at, 0) > 2.0:
+                        vibrate_band("warn", hand="both")
                         with vib_lock:
                             vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "long"
                             vibrate_command["reason"] = _at; vibrate_command["severity"] = "critical"
@@ -881,6 +935,8 @@ while True:
                     last_rep_feedback += f" (depth: {min(squat_angles_this_rep):.0f}deg)"
                 feedback_display_timer = time.time()
                 _non_crit = [a for a in rep_alerts_buffer if a not in CRITICAL_IMMEDIATE]
+                if _non_crit:
+                    vibrate_band("buzz", hand="both")
                 with vib_lock:
                     if _non_crit:
                         vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "short"
@@ -904,6 +960,13 @@ while True:
                 _right_raise = kps[0][1] - kps[1][1]
                 if abs(_left_raise - _right_raise) > 40 and "Raise both arms evenly" not in rep_alerts_buffer:
                     rep_alerts_buffer.append("Raise both arms evenly")
+                    _now_t = time.time()
+                    if _now_t - last_alert_time.get("VIB_raise_asym", 0) > 2.0:
+                        if _left_raise < _right_raise - 40:
+                            vibrate_band("buzz", hand="left")
+                        else:
+                            vibrate_band("buzz", hand="right")
+                        last_alert_time["VIB_raise_asym"] = _now_t
                 if rep_phase == "active" and max_velocity > 35 and "Slow down - control the movement" not in rep_alerts_buffer:
                     rep_alerts_buffer.append("Slow down - control the movement")
             _ema_metric = 0.35 * (kps[1][1] - kps[0][1]) + 0.65 * _ema_metric
@@ -921,6 +984,8 @@ while True:
                     last_rep_feedback += f" (height: {'good' if min(raise_heights_this_rep) < 20 else 'low'})"
                 feedback_display_timer = time.time()
                 _non_crit = [a for a in rep_alerts_buffer if a not in CRITICAL_IMMEDIATE]
+                if _non_crit:
+                    vibrate_band("buzz", hand="both")
                 with vib_lock:
                     if _non_crit:
                         vibrate_command["vibrate"] = True; vibrate_command["pattern"] = "short"
@@ -978,16 +1043,21 @@ while True:
                 (DISPLAY_W - 120, 75), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 0), 4)
 
     # Info line (just below top bar)
-    _band_str = "Band: CONNECTED"     if _imu_ts > 0 else "Band: NOT CONNECTED"
-    _band_col = (0, 220, 0)           if _imu_ts > 0 else (0, 220, 220)
     cv2.putText(display, f"FPS:{fps:.1f} {ms:.1f}ms  ACC:{_ax:.1f},{_imu_ay:.1f}  GYRO:{_gz:.0f}  T:{_tp:.1f}C",
                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
-    cv2.putText(display, _band_str,
-                (430, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.35, _band_col, 1)
 
     # Phase + velocity indicator
     cv2.putText(display, f"Phase: {rep_phase}  Vel: {max_velocity:.0f}px/f",
                 (10, DISPLAY_H - 95), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+    # Dual-band status
+    _r_ok = band_status["right"]
+    _l_ok = band_status["left"]
+    _right_str = "R:LIVE" if _r_ok else "R:OFF"
+    _left_str  = "L:LIVE" if _l_ok else "L:OFF"
+    _band_col  = (0, 255, 0) if (_r_ok and _l_ok) else (0, 165, 255) if (_r_ok or _l_ok) else (0, 0, 255)
+    cv2.putText(display, f"Band {_right_str} {_left_str}",
+                (DISPLAY_W - 200, DISPLAY_H - 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, _band_col, 1)
 
     # Instructions bar — always visible, subtle grey
     cv2.rectangle(display, (0, DISPLAY_H - 90), (DISPLAY_W, DISPLAY_H - 55), (40, 40, 40), -1)
@@ -1020,7 +1090,9 @@ while True:
         output_frame = display.copy()
 
     if frame_count % 100 == 0:
-        print(f"[SUMMARY] Exercise:{EXERCISE_NAMES[exercise]} Reps:{total_reps} LastFeedback:{last_rep_feedback[:50]} Band:{'connected' if _imu_ts > 0 else 'disconnected'} Latency:{ms:.1f}ms FPS:{fps:.1f}")
+        _b_str = ("R+L" if (band_status["right"] and band_status["left"]) else
+                  "R" if band_status["right"] else "L" if band_status["left"] else "none")
+        print(f"[SUMMARY] Exercise:{EXERCISE_NAMES[exercise]} Reps:{total_reps} LastFeedback:{last_rep_feedback[:50]} Band:{_b_str} Latency:{ms:.1f}ms FPS:{fps:.1f}")
 
     _key = cv2.waitKey(1) & 0xFF
     if _key == ord('q'):
