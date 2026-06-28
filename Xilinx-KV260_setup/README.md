@@ -1,3 +1,11 @@
+![AMD Xilinx](https://img.shields.io/badge/AMD--Xilinx-E01F26?style=for-the-badge&logo=amd&logoColor=white)
+![Kria KV260](https://img.shields.io/badge/Kria-KV260-0066CC?style=for-the-badge)
+![Vivado](https://img.shields.io/badge/Vivado-FPGA-orange?style=for-the-badge)
+![FPGA](https://img.shields.io/badge/FPGA-Hardware-blue?style=for-the-badge)
+![ESP32-S3](https://img.shields.io/badge/ESP32--S3-E7352C?style=for-the-badge)
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![C++](https://img.shields.io/badge/C++-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
+
 # 🏋️ Workout Injury Prevention System — AMD KV260 FPGA
 
 Real-time human pose estimation running **entirely on FPGA fabric** using the AMD KV260's DPU. Detects 14 body joint keypoints from a live camera feed and provides instant posture analysis and injury prevention alerts — with **~20ms latency** vs 1000ms+ cloud inference.
