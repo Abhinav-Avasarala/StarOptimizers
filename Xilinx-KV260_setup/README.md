@@ -1,10 +1,12 @@
-![AMD Xilinx](https://img.shields.io/badge/AMD--Xilinx-E01F26?style=for-the-badge&logo=amd&logoColor=white)
-![Kria KV260](https://img.shields.io/badge/Kria-KV260-0066CC?style=for-the-badge)
-![Vivado](https://img.shields.io/badge/Vivado-FPGA-orange?style=for-the-badge)
-![FPGA](https://img.shields.io/badge/FPGA-Hardware-blue?style=for-the-badge)
-![ESP32-S3](https://img.shields.io/badge/ESP32--S3-E7352C?style=for-the-badge)
-![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![C++](https://img.shields.io/badge/C++-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
+<p align="center">
+  <img src="https://img.shields.io/badge/AMD-Xilinx-E01F26?style=for-the-badge" alt="AMD Xilinx"/>
+  <img src="https://img.shields.io/badge/Kria-KV260-0066CC?style=for-the-badge" alt="Kria KV260"/>
+  <img src="https://img.shields.io/badge/Vivado-FD7E14?style=for-the-badge" alt="Vivado"/>
+  <img src="https://img.shields.io/badge/FPGA-4B8BBE?style=for-the-badge" alt="FPGA"/>
+  <img src="https://img.shields.io/badge/ESP32--S3-E7352C?style=for-the-badge" alt="ESP32-S3"/>
+  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>
+  <img src="https://img.shields.io/badge/C%2B%2B-00599C?style=for-the-badge&logo=cplusplus&logoColor=white" alt="C++"/>
+</p>
 
 # 🏋️ Workout Injury Prevention System — AMD KV260 FPGA
 
